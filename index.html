@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f8f2c8">
+<title>Kinetic Circles</title>
+<style>
+  @font-face { font-family: 'Source Sans'; src: url('SourceSansVariable-Roman.otf') format('opentype'); font-weight: 200 900; font-display: block; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #f8f2c8; }
+  body { color: #17120f; font-family: 'Courier New', Courier, monospace; }
+  body { isolation: isolate; }
+  /* A neutral, locally balanced grain gives paper and ink the same fine tooth.
+     Soft light adds tiny variations without the old dark multiply wash. */
+  #print-surface {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-position: center;
+    background-size: cover;
+    mix-blend-mode: soft-light;
+    opacity: .38;
+    z-index: 1;
+  }
+  #paper-surface {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-position: center;
+    background-size: cover;
+    mix-blend-mode: multiply;
+    opacity: .28;
+    z-index: 2;
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; -webkit-tap-highlight-color: transparent; outline: none; }
+  canvas:focus-visible + .position { text-decoration: underline; text-underline-offset: 4px; }
+  #email-link { position: fixed; z-index: 3; color: transparent; font-size: 0; cursor: pointer; border-radius: 2px; }
+  #email-link:focus-visible { outline: 1px solid #17120f; outline-offset: 4px; }
+  .position { clip-path: inset(50%); width: 1px; height: 1px; overflow: hidden; position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); margin: 0; font-size: 11px; font-weight: 400; letter-spacing: .12em; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas tabindex="0" role="region" aria-label="Five interactive circles. Use arrow keys or drag to navigate. Tap a ball to center it. Click the background to return to the first circle."></canvas>
+<p class="position" aria-live="polite" aria-atomic="true">1 / 5</p>
+<a id="email-link" href="mailto:searonen7@gmail.com" aria-label="Email Sea Ronen: searonen7@gmail.com" hidden>searonen7@gmail.com</a>
+<div id="print-surface" aria-hidden="true"></div>
+<div id="paper-surface" aria-hidden="true"></div>
+<script>
+'use strict';
+const canvas = document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const counter = document.querySelector('.position');
+const emailLink = document.querySelector('#email-link');
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const count = 5;
+const artwork = [];
+// Bounds measured against each circle in the Illustrator sketch.
+const layout = [
+  [.15, .33, .735, 382.51 / 736.46],
+  [.18, .11, .70, 771.12 / 693.1],
+  [.145, .195, .76, 784.75 / 875.01],
+  [.13, .36, .74, 336.81 / 735.76],
+  [.115, .075, .79, 930.26 / 825.35]
+];
+let ready = false;
+let width, height, diameter;
+let position = 0, selected = 0, frame = 0, animation = null, drag = null;
+let shapes = [];
+let mode = 'intro', introTime = 0;
+const entranceTiming = { delay: 300, stagger: 110, fall: 1, roll: 1.1, fade: 1780 };
+// Wait for even the last circle to settle, then allow a short resting beat.
+const frameRevealStart = entranceTiming.delay + (count - 1) * entranceTiming.stagger
+  + (entranceTiming.fall + entranceTiming.roll) * 1000 + 100;
+const unit = value => Math.max(0, Math.min(1, value));
+const smooth = t => t * t * (3 - 2 * t);
+// One physical trajectory for the whole entrance: gravity, small rebounds,
+// then friction-limited rolling. Later balls start slightly later so they
+// remain separated rather than passing through each other.
+function entrancePose(seconds) {
+  const t = Math.max(0, seconds);
+  const distance = height / 2 + diameter / 2 + 32;
+  const fall = entranceTiming.fall;
+  const gravity = 2 * distance / (fall * fall);
+  const rollTime = entranceTiming.roll;
+  const rollDistance = diameter * .065;
+  const horizontalSpeed = 2 * rollDistance / rollTime;
+  let x, y;
+  if (t < fall) {
+    y = -distance + .5 * gravity * t * t;
+    x = rollDistance + horizontalSpeed * (fall - t);
+  } else {
+    const afterImpact = t - fall;
+    // Constant deceleration makes travel and angular speed both finish at zero.
+    x = rollDistance * (1 - unit(afterImpact / rollTime)) ** 2;
+    let flightTime = afterImpact;
+    let velocity = gravity * fall * .19;
+    y = 0;
+    while (velocity * velocity / (2 * gravity) > .15) {
+      const duration = 2 * velocity / gravity;
+      if (flightTime <= duration) {
+        y = Math.min(0, -velocity * flightTime + .5 * gravity * flightTime ** 2);
+        break;
+      }
+      flightTime -= duration;
+      velocity *= .19;
+    }
+  }
+  // Arc length = radius × angle: the artwork belongs to the rolling surface.
+  return { x, y, angle: x / (diameter / 2) };
+}
+const clamp = value => Math.max(0, Math.min(count - 1, value));
+
+function render() {
+  const r = diameter / 2;
+  const segment = Math.min(count - 2, Math.floor(position));
+  const progress = position - segment;
+  // Give the covered middle of the transition more time. This mapping is
+  // monotonic and reversible, including when scrubbing with a pointer.
+  const p = progress + .72 * Math.sin(2 * Math.PI * progress) / (2 * Math.PI);
+  // Restore the overlapping turn, but never project or resize the lettering.
+  const wave = Math.sin(Math.PI * p) ** 4;
+  const signedRadius = r * Math.cos(Math.PI * p) * (1 + 3 * wave);
+  const coverRadius = Math.hypot(signedRadius, r * .32 * wave);
+  const coverHeight = r * (1 + 3.5 * wave);
+  const pivot = width / 2 + r * (1 - 2 * p);
+  const coverX = pivot + signedRadius;
+  const regularRow = mode === 'intro' || mode === 'return';
+  shapes = Array.from({ length: count }, (_, index) => {
+    const pose = mode === 'intro'
+      ? entrancePose((introTime - entranceTiming.delay - index * entranceTiming.stagger) / 1000)
+      : { x: 0, y: 0, angle: 0 };
+    return {
+      index,
+      x: width / 2 + (index - (regularRow ? position : segment + p)) * diameter + pose.x,
+      y: height / 2 + pose.y,
+      angle: pose.angle,
+      rx: r, ry: r
+    };
+  });
+  if (!regularRow) {
+    shapes[segment] = { index: segment, x: width / 2, y: height / 2, rx: r, ry: r };
+    shapes[segment + 1] = { index: segment + 1, x: coverX, y: height / 2, rx: coverRadius, ry: coverHeight };
+  }
+
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, width, height);
+  // Build one alpha mask. XOR inverts everything below an overlapping shape,
+  // including the rules and lettering. Colorize once for an exact two-ink result.
+  ctx.globalCompositeOperation = 'xor';
+  ctx.fillStyle = '#fff';
+  ctx.globalAlpha = mode === 'intro' ? smooth(unit((introTime - frameRevealStart) / entranceTiming.fade)) : 1;
+  const mobile = width <= 600;
+  const inset = mobile ? Math.max(14, width * .04) : width * .017;
+  const availableWidth = width - inset * 2;
+  let fontSize = Math.max(13, Math.min(width * .026, height * .043));
+  ctx.textBaseline = 'middle';
+  // Courier has no medium weight: a fine outline gives a restrained in-between.
+  function drawTitle(text, x, y) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = mobile ? Math.max(.38, fontSize * .021) : Math.max(.5, fontSize * .028);
+    ctx.lineJoin = 'round';
+    ctx.strokeText(text, x, y);
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+  if (mobile) {
+    // Fit one continuous title to the same grid as the rules.
+    ctx.font = '400 100px "Courier New", Courier, monospace';
+    fontSize = Math.min(30, availableWidth / ctx.measureText('MY EXPERIMENTAL WEBSITE').width * 100);
+    ctx.font = `400 ${fontSize}px "Courier New", Courier, monospace`;
+    ctx.textAlign = 'center';
+    drawTitle('MY EXPERIMENTAL WEBSITE', width / 2, height * .049);
+  } else {
+    ctx.font = `400 ${fontSize}px "Courier New", Courier, monospace`;
+    ctx.textAlign = 'left';
+    drawTitle('MY', inset, height * .049);
+    ctx.textAlign = 'center';
+    drawTitle('EXPERIMENTAL', width / 2, height * .049);
+    ctx.textAlign = 'right';
+    drawTitle('WEBSITE', width - inset, height * .049);
+  }
+  const rule = Math.max(.75, height / 700);
+  ctx.fillRect(inset, height * (mobile ? .08 : .102), availableWidth, rule);
+  const bottomRuleY = height * (mobile ? .917 : .879);
+  if (!mobile) ctx.fillRect(inset, bottomRuleY, availableWidth, rule);
+
+  // Mobile pagination is integrated into the lower rule, like a printed folio.
+  let footerSize = mobile ? 11.5 : Math.max(11, fontSize * .48);
+  ctx.font = `400 ${footerSize}px "Courier New", Courier, monospace`;
+  const contactWidth = ctx.measureText('WROTE BY SEA RONEN').width
+    + ctx.measureText('searonen7@gmail.com').width;
+  footerSize *= Math.min(1, (availableWidth - 20) / contactWidth);
+  const emailY = height * (mobile ? .953 : .94);
+  const creditY = emailY;
+  ctx.font = `400 ${footerSize}px "Courier New", Courier, monospace`;
+  ctx.textAlign = 'left';
+  ctx.fillText('WROTE BY SEA RONEN', inset, creditY);
+  ctx.textAlign = 'right';
+  ctx.fillText('searonen7@gmail.com', width - inset, emailY);
+  const emailWidth = ctx.measureText('searonen7@gmail.com').width;
+  const emailHeight = Math.max(28, footerSize * 1.6);
+  emailLink.hidden = ctx.globalAlpha < .1;
+  Object.assign(emailLink.style, {
+    left: `${width - inset - emailWidth}px`,
+    top: `${emailY - emailHeight / 2}px`,
+    width: `${emailWidth}px`, height: `${emailHeight}px`
+  });
+  const counterSize = mobile ? 16 : Math.max(19, fontSize * .68);
+  ctx.font = `400 ${counterSize}px "Courier New", Courier, monospace`;
+  ctx.textAlign = 'center';
+  const counterY = mobile ? bottomRuleY + rule / 2 : emailY;
+  const counterText = mobile ? `${selected + 1}/${count}` : `${selected + 1} / ${count}`;
+  if (mobile) {
+    const halfGap = ctx.measureText(counterText).width / 2 + 12;
+    const lineWidth = width / 2 - halfGap - inset;
+    ctx.fillRect(inset, bottomRuleY, lineWidth, rule);
+    ctx.fillRect(width / 2 + halfGap, bottomRuleY, lineWidth, rule);
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = mobile ? .28 : .4;
+  ctx.lineJoin = 'round';
+  ctx.strokeText(counterText, width / 2, counterY);
+  ctx.fillText(counterText, width / 2, counterY);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+
+  for (const shape of shapes) {
+    if (shape.rx < .0001) continue;
+    ctx.beginPath();
+    ctx.ellipse(shape.x, shape.y, shape.rx, shape.ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  if (ready) shapes.forEach((shape, index) => {
+    const center = !regularRow && index === segment;
+    const cover = !regularRow && index === segment + 1;
+    let design = index;
+    if (!regularRow && p >= .5) {
+      if (center) design = segment + 1;
+      if (cover) design = segment;
+    }
+    if (shape.x - shape.rx > width || shape.x + shape.rx < 0) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(shape.x, shape.y, shape.rx, shape.ry, 0, 0, Math.PI * 2);
+    ctx.clip();
+    function drawDesign(id) {
+      const [l, t, scale, ratio] = layout[id];
+      const size = scale * diameter;
+      ctx.save();
+      ctx.translate(shape.x, shape.y);
+      ctx.rotate(shape.angle || 0);
+      ctx.drawImage(artwork[id], (l - .5) * diameter,
+        (t - .5) * diameter, size, size * ratio);
+      ctx.restore();
+    }
+    if (center) {
+      // Trace the curved inner edge of the turning surface. The artwork stays
+      // fixed; this seam reveals the new design progressively, without scaling.
+      const edge = new Path2D();
+      edge.moveTo(width + 1, 0);
+      for (let y = 0; y <= height + 8; y += 8) {
+        const dy = (y - height / 2) / coverHeight;
+        const x = pivot + signedRadius * (1 - Math.sqrt(Math.max(0, 1 - dy * dy)));
+        edge.lineTo(x, y);
+      }
+      edge.lineTo(width + 1, height + 8);
+      edge.closePath();
+      ctx.save();
+      const outside = new Path2D();
+      outside.rect(-1, -1, width + 2, height + 2);
+      outside.addPath(edge);
+      ctx.clip(outside, 'evenodd');
+      drawDesign(segment);
+      ctx.restore();
+      ctx.save(); ctx.clip(edge); drawDesign(segment + 1); ctx.restore();
+    } else {
+      if (cover) {
+        // The neighboring ball occludes the moving ball's text, just as two
+        // physical surfaces would. No iris or miniature version of the SVG.
+        ctx.beginPath();
+        ctx.rect(0, 0, width, height);
+        ctx.moveTo(width / 2 + r, height / 2);
+        ctx.arc(width / 2, height / 2, r, 0, Math.PI * 2);
+        ctx.clip('evenodd');
+      }
+      drawDesign(design);
+    }
+    ctx.restore();
+  });
+  ctx.globalCompositeOperation = 'source-in';
+  ctx.fillStyle = '#17120f';
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.fillStyle = '#f8f2c8';
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalCompositeOperation = 'source-over';
+}
+function updateCounter() { counter.textContent = `${selected + 1} / ${count}`; }
+function stop() { cancelAnimationFrame(frame); animation = null; }
+function goTo(index) {
+  stop();
+  mode = 'navigate';
+  selected = clamp(index);
+  updateCounter();
+  const from = position, to = selected;
+  if (reducedMotion.matches || Math.abs(to - from) < .00001) {
+    position = to; render(); return;
+  }
+  animation = { from, to, start: performance.now(), duration: 1450 * Math.max(.32, Math.abs(to - from)) };
+  function tick(now) {
+    if (!animation) return;
+    const t = Math.max(0, Math.min(1, (now - animation.start) / animation.duration));
+    // Quintic easing: no spring, bounce, overshoot, or abrupt start/finish.
+    const ease = t * t * t * (t * (t * 6 - 15) + 10);
+    position = clamp(animation.from + (animation.to - animation.from) * ease);
+    render();
+    if (t < 1) frame = requestAnimationFrame(tick);
+    else { animation = null; position = to; render(); }
+  }
+  frame = requestAnimationFrame(tick);
+}
+function startIntro() {
+  stop();
+  if (reducedMotion.matches) { mode = 'navigate'; render(); return; }
+  mode = 'intro';
+  const start = performance.now();
+  function tick(now) {
+    introTime = Math.max(0, now - start);
+    render();
+    if (introTime < frameRevealStart + entranceTiming.fade) frame = requestAnimationFrame(tick);
+    else { mode = 'navigate'; render(); }
+  }
+  frame = requestAnimationFrame(tick);
+}
+function returnHome() {
+  stop();
+  const from = position;
+  selected = 0; updateCounter();
+  if (reducedMotion.matches || from < .001) {
+    position = 0; mode = 'navigate'; render(); return;
+  }
+  mode = 'return';
+  const start = performance.now();
+  function tick(now) {
+    const elapsed = Math.max(0, (now - start) / 1000);
+    const travel = .7;
+    // Longer trips carry a little more energy into the same soft spring.
+    const impactSpeed = Math.min(1.25 + .14 * from, 3 * from / travel);
+    if (elapsed < travel) {
+      const t = elapsed / travel;
+      // Cubic Hermite joins the slide to the spring with continuous velocity.
+      position = from * (2*t*t*t - 3*t*t + 1) - impactSpeed * travel * (t*t*t - t*t);
+    } else {
+      const t = elapsed - travel;
+      position = -impactSpeed / 7.5 * Math.exp(-3.8 * t) * Math.sin(7.5 * t);
+    }
+    render();
+    if (elapsed < 2.5) frame = requestAnimationFrame(tick);
+    else { position = 0; mode = 'navigate'; render(); }
+  }
+  frame = requestAnimationFrame(tick);
+}
+function hitTest(x, y) {
+  // Prefer the centered circle when silhouettes overlap during a flip.
+  return [...shapes].sort((a, b) => a.rx - b.rx).find(shape =>
+    shape.rx > .001 && ((x - shape.x) / shape.rx) ** 2 + ((y - height / 2) / shape.ry) ** 2 <= 1);
+}
+function resize() {
+  stop();
+  if (ready) mode = 'navigate';
+  if (drag && canvas.hasPointerCapture(drag.id)) canvas.releasePointerCapture(drag.id);
+  drag = null;
+  width = innerWidth; height = innerHeight;
+  diameter = Math.min(height * .632, width * (width <= 600 ? .897 : .78));
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(width * dpr); canvas.height = Math.round(height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  position = selected;
+  render();
+}
+canvas.addEventListener('pointerdown', event => {
+  if (!event.isPrimary || event.button !== 0 || drag || !ready || mode === 'intro') return;
+  const hit = hitTest(event.clientX, event.clientY);
+  stop();
+  mode = 'navigate';
+  position = clamp(position);
+  drag = { id: event.pointerId, x: event.clientX, start: position, distance: 0, canDrag: !!hit, target: hit ? (mode === 'navigate' && position % 1 > .5 && hit.index === Math.floor(position) ? Math.ceil(position) : hit.index) : null };
+  canvas.setPointerCapture(event.pointerId);
+  canvas.style.cursor = 'grabbing';
+});
+canvas.addEventListener('pointermove', event => {
+  if (!drag) {
+    canvas.style.cursor = hitTest(event.clientX, event.clientY) ? 'grab' : 'default';
+    return;
+  }
+  if (event.pointerId !== drag.id) return;
+  if (!drag.canDrag) return;
+  const delta = event.clientX - drag.x;
+  drag.distance = Math.max(drag.distance, Math.abs(delta));
+  // Hard bounds eliminate elastic edge motion and rebound.
+  position = clamp(drag.start - delta / diameter);
+  render();
+});
+function finish(event, cancelled = false) {
+  if (!drag || event.pointerId !== drag.id) return;
+  const gesture = drag;
+  drag = null;
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  canvas.style.cursor = 'grab';
+  if (cancelled) { goTo(Math.round(position)); return; }
+  if (gesture.distance < 7) {
+    if (gesture.target === null) returnHome();
+    else {
+      const current = Math.round(position);
+      goTo(gesture.target === current ? (current < count - 1 ? current + 1 : current - 1) : gesture.target);
+    }
+  } else {
+    const delta = position - gesture.start;
+    const target = Math.abs(delta) > .10
+      ? (delta > 0 ? Math.ceil(position) : Math.floor(position)) : Math.round(position);
+    goTo(target);
+  }
+}
+canvas.addEventListener('pointerup', event => finish(event));
+canvas.addEventListener('pointercancel', event => finish(event, true));
+canvas.addEventListener('lostpointercapture', event => finish(event, true));
+addEventListener('keydown', event => {
+  if (event.target.closest?.('a, button, input, textarea, select')) return;
+  if (!ready || mode === 'intro' || mode === 'return' || drag || event.altKey || event.ctrlKey || event.metaKey) return;
+  const forward = ['ArrowRight', 'ArrowDown', 'Enter', ' '].includes(event.key);
+  const backward = ['ArrowLeft', 'ArrowUp'].includes(event.key);
+  if (!forward && !backward) return;
+  event.preventDefault();
+  if (event.repeat || animation) return;
+  goTo(selected + (forward ? 1 : -1));
+});
+addEventListener('resize', resize);
+resize();
+// Process the source once, not on animation frames. Local mean removal
+// eliminates the photographed lighting gradient; local variance normalization
+// keeps the quieter upper-left fibers as gentle as the stronger lower-right.
+async function preparePrintSurface() {
+  const photo = new Image();
+  photo.src = 'papertxture.jpeg';
+  await photo.decode();
+  const surface = document.createElement('canvas');
+  const w = surface.width = 1600;
+  const h = surface.height = Math.round(w * photo.naturalHeight / photo.naturalWidth);
+  const paint = surface.getContext('2d', { willReadFrequently: true });
+  paint.drawImage(photo, 0, 0, w, h);
+  const pixels = paint.getImageData(0, 0, w, h);
+  const values = new Float32Array(w * h);
+  const stride = w + 1;
+  const sums = new Float64Array(stride * (h + 1));
+  const squares = new Float64Array(sums.length);
+  for (let y = 0; y < h; y++) {
+    let sum = 0, square = 0;
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, p = i * 4;
+      const v = pixels.data[p] * .2126 + pixels.data[p + 1] * .7152 + pixels.data[p + 2] * .0722;
+      values[i] = v; sum += v; square += v * v;
+      const j = (y + 1) * stride + x + 1;
+      sums[j] = sums[j - stride] + sum;
+      squares[j] = squares[j - stride] + square;
+    }
+  }
+  const area = (table, x0, y0, x1, y1) => table[y1 * stride + x1]
+    - table[y0 * stride + x1] - table[y1 * stride + x0] + table[y0 * stride + x0];
+  // Local mean removes the photo's lighting gradient; local variance gives
+  // the bright and shaded corners equal grain strength. Limit the range so
+  // even the strongest fibers stay quiet on both paper and lettering.
+  const radius = 26;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - radius), x1 = Math.min(w, x + radius + 1);
+    const y0 = Math.max(0, y - radius), y1 = Math.min(h, y + radius + 1);
+    const n = (x1 - x0) * (y1 - y0);
+    const mean = area(sums, x0, y0, x1, y1) / n;
+    const variance = Math.max(0, area(squares, x0, y0, x1, y1) / n - mean * mean);
+    const relief = (values[y * w + x] - mean) / Math.max(3, Math.sqrt(variance));
+    const shade = Math.round(127.5 + 24 * Math.tanh(relief * .8));
+    const i = (y * w + x) * 4;
+    pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = shade;
+    pixels.data[i + 3] = 255;
+  }
+  paint.putImageData(pixels, 0, 0);
+  document.querySelector('#print-surface').style.backgroundImage = `url(${surface.toDataURL()})`;
+  // Soft light is restrained on pale yellow. A separate, near-white multiply
+  // pass brings out the balanced paper fibers without strengthening the ink.
+  for (let i = 0; i < pixels.data.length; i += 4) {
+    const paper = Math.max(221, Math.min(255, 238 + (pixels.data[i] - 127.5) * 17 / 24));
+    pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = paper;
+  }
+  paint.putImageData(pixels, 0, 0);
+  document.querySelector('#paper-surface').style.backgroundImage = `url(${surface.toDataURL()})`;
+}
+preparePrintSurface().catch(error => console.warn('Paper surface unavailable', error));
+Promise.all([
+  document.fonts.load('400 24px "Courier New"'),
+  document.fonts.load('700 24px "Courier New"'),
+  ...Array.from({ length: count }, (_, i) => new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => { artwork[i] = image; resolve(); };
+    image.onerror = reject;
+    image.src = i === 4 ? 'assets/circle5-embedded.svg' : `circle_text/SVG/circle${i + 1}.svg`;
+  }))
+]).then(() => { ready = true; startIntro(); }).catch(error => console.error('Could not load artwork', error));
+</script>
+</body>
+</html>
